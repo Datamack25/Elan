@@ -16,7 +16,17 @@ import streamlit as st
 import db
 
 st.set_page_config(page_title="ÉLAN · Financer les jeunes entrepreneurs", page_icon="🚀", layout="wide")
-db.init_db()
+
+
+@st.cache_resource(show_spinner="Préparation de la plateforme…")
+def _init_database() -> bool:
+    """Exécuté une seule fois par serveur (et non à chaque session/rerun)."""
+    db.init_db()
+    return True
+
+
+_init_database()
+db.refresh_statuses()
 
 ACCENT = "#0f766e"
 CHART_COLORS = ["#0f766e", "#f59e0b", "#6366f1", "#e11d48", "#0ea5e9", "#84cc16", "#a855f7", "#f97316", "#14b8a6", "#64748b", "#ec4899"]
@@ -138,6 +148,40 @@ def project_card(p: dict, show_score: str | None = None, prefix: str = "c"):
         go_to("Fiche projet", project_id=int(p["id"]))
 
 
+def haiti_map(height: int = 520, key: str = "map", compact: bool = False):
+    """Carte d'Haïti : une bulle par département, taille = indicateur choisi."""
+    import math
+
+    dep = db.department_stats()
+    metrics = ["Projets soutenus", "Montant levé (€)", "Projets financés", "Emplois créés", "Contributeurs"]
+    metric = "Projets soutenus" if compact else st.radio(
+        "Indicateur représenté", metrics, horizontal=True, key=f"{key}_metric")
+    vmax = max(dep[metric].max(), 1)
+    dep["size"] = dep[metric].apply(lambda v: 12 + 46 * math.sqrt(v / vmax) if v > 0 else 9)
+    dep["label"] = dep[metric].apply(lambda v: eur(v) if metric == "Montant levé (€)" else num(v))
+    hover = ("<b>%{customdata[0]}</b> — %{customdata[1]}<br>"
+             "Projets soutenus : %{customdata[2]}<br>Projets financés : %{customdata[3]}<br>"
+             "En collecte : %{customdata[4]}<br>Montant levé : %{customdata[5]}<br>"
+             "Emplois créés : %{customdata[6]}<extra></extra>")
+    custom = list(zip(dep["Département"], dep["Chef-lieu"], dep["Projets soutenus"], dep["Projets financés"],
+                      dep["En collecte"], dep["Montant levé (€)"].apply(eur), dep["Emplois créés"]))
+    fig = go.Figure(go.Scattermap(
+        lat=dep["lat"], lon=dep["lon"], mode="markers+text",
+        marker=dict(size=dep["size"], color=dep[metric], colorscale=[[0, "#99f6e4"], [1, "#0f766e"]],
+                    opacity=0.85, showscale=not compact,
+                    colorbar=dict(title=dict(text=metric, side="right"), thickness=12, len=0.7)),
+        text=[f"{d} · {l}" for d, l in zip(dep["Département"], dep["label"])],
+        textposition="bottom center", textfont=dict(size=12, color="#0f172a"),
+        customdata=custom, hovertemplate=hover,
+    ))
+    fig.update_layout(
+        map=dict(style="carto-positron", center=dict(lat=19.0, lon=-72.85), zoom=6.9 if not compact else 6.6),
+        height=height, margin=dict(l=0, r=0, t=0, b=0), paper_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig, width="stretch", key=key, config={"scrollZoom": False})
+    return dep
+
+
 def card_grid(df: pd.DataFrame, cols: int = 3, score_fn=None, prefix: str = "g"):
     rows = [df.iloc[i:i + cols] for i in range(0, len(df), cols)]
     for chunk in rows:
@@ -239,7 +283,8 @@ def page_home():
     st.markdown(
         """<div class='hero'><h1>Donnons de l'élan aux projets des jeunes.</h1>
 <p>Soutenez par le don, prêtez ou investissez au capital de projets portés par des entrepreneurs de moins de 30 ans,
-en métropole et dans les Outre-mer. Chaque euro est suivi, chaque impact est mesuré.</p></div>""",
+dans les dix départements d'Haïti. Diaspora, investisseurs et citoyens : chaque gourde et chaque euro sont suivis,
+chaque impact est mesuré.</p></div>""",
         unsafe_allow_html=True,
     )
     funded = all_df[all_df["status"] == "finance"]
@@ -250,6 +295,17 @@ en métropole et dans les Outre-mer. Chaque euro est suivi, chaque impact est me
     kpi(c[2], f"{(len(funded) / len(closed) * 100 if len(closed) else 0):.0f} %", "Taux de réussite")
     kpi(c[3], num(funded["jobs_done"].sum()), "Emplois créés")
     kpi(c[4], num(confirmed["user_id"].nunique() if not confirmed.empty else 0), "Contributeurs")
+
+    st.markdown("### 🇭🇹 Projets soutenus à travers Haïti")
+    m, side = st.columns([2.2, 1])
+    with m:
+        dep = haiti_map(height=430, key="home_map", compact=True)
+    with side:
+        top = dep.sort_values(["Projets soutenus", "Montant levé (€)"], ascending=False)
+        for _, r in top.iterrows():
+            st.markdown(f"**{r['Département']}** — {num(r['Projets soutenus'])} projet(s) · {eur(r['Montant levé (€)'])}")
+        if st.button("Voir le tableau de bord complet →", key="home_to_stats"):
+            go_to("Statistiques")
 
     st.markdown("### 🏆 Ils ont réussi leur levée")
     card_grid(funded.sort_values("funded_at", ascending=False).head(3), prefix="home_f")
@@ -271,7 +327,7 @@ def filters_and_ranking(df: pd.DataFrame, prefs: dict):
         c1, c2, c3 = st.columns(3)
         q = c1.text_input("Recherche", placeholder="Mot-clé, nom de projet…")
         sectors = c1.multiselect("Secteurs", list(db.SECTORS), default=prefs.get("sectors", []))
-        regions = c2.multiselect("Territoires", db.REGIONS, default=prefs.get("regions", []))
+        regions = c2.multiselect("Départements", db.REGIONS, default=prefs.get("regions", []))
         modes = c2.multiselect("Mode de financement", list(db.MODES), format_func=db.MODES.get, default=prefs.get("modes", []))
         odd = c3.multiselect("Objectifs de développement durable (ODD)", list(db.ODD),
                              format_func=lambda k: f"ODD {k} · {db.ODD[k]}", default=prefs.get("odd", []))
@@ -337,7 +393,7 @@ def page_explore():
     if view == "Tableau":
         t = f[["title", "sector", "region", "mode", "goal", "raised", "pct", "match", "criteria_score", "impact_score", "days_left"]].copy()
         t["mode"] = t["mode"].map(db.MODES)
-        t.columns = ["Projet", "Secteur", "Territoire", "Mode", "Objectif €", "Levé €", "Avancement %", "Adéquation",
+        t.columns = ["Projet", "Secteur", "Département", "Mode", "Objectif €", "Levé €", "Avancement %", "Adéquation",
                      "Critères", "Impact", "Jours restants"]
         st.dataframe(t, hide_index=True, width="stretch",
                      column_config={"Avancement %": st.column_config.ProgressColumn(format="%.0f%%", min_value=0, max_value=100),
@@ -577,7 +633,25 @@ def page_stats():
     kpi(c[5], f"{df['founder_age'].mean():.0f} ans", "Âge moyen porteurs")
     st.write("")
 
-    t1, t2, t3, t4 = st.tabs(["💶 Collecte", "🗺️ Secteurs & territoires", "🌍 Impact", "🏅 Classements"])
+    st.markdown("### 🇭🇹 Carte d'Haïti — projets soutenus par département")
+    st.caption("Projet soutenu = projet publié ayant reçu au moins une contribution confirmée. "
+               "Survolez une bulle pour le détail du département.")
+    dep = haiti_map(height=560, key="stats_map")
+    covered = int((dep["Projets soutenus"] > 0).sum())
+    c = st.columns(4)
+    kpi(c[0], f"{covered} / 10", "Départements couverts")
+    kpi(c[1], num(dep["Projets soutenus"].sum()), "Projets soutenus")
+    lead = dep.sort_values("Montant levé (€)", ascending=False).iloc[0]
+    kpi(c[2], esc(lead["Département"]), "1er département (montant)")
+    kpi(c[3], eur(lead["Montant levé (€)"]), "Levé dans ce département")
+    with st.expander("Tableau par département"):
+        t = dep.drop(columns=["lat", "lon"]).sort_values("Projets soutenus", ascending=False)
+        st.dataframe(t, hide_index=True, width="stretch",
+                     column_config={"Montant levé (€)": st.column_config.NumberColumn(format="%d €")})
+        st.download_button("⬇️ Exporter (CSV)", t.to_csv(index=False).encode("utf-8-sig"), "elan_departements.csv", "text/csv")
+    st.write("")
+
+    t1, t2, t3, t4 = st.tabs(["💶 Collecte", "🗺️ Secteurs & départements", "🌍 Impact", "🏅 Classements"])
     with t1:
         m = confirmed.set_index("created_at").resample("ME")["amount"].sum().reset_index()
         m["Cumul"] = m["amount"].cumsum()
@@ -600,7 +674,7 @@ def page_stats():
         s = df.groupby("sector").agg(Levé=("raised", "sum"), Projets=("id", "count")).reset_index().sort_values("Levé")
         a.plotly_chart(plot_style(px.bar(s, x="Levé", y="sector", orientation="h", title="Montant levé par secteur (€)", text="Projets"), 420), width="stretch")
         r = df.groupby("region").agg(Levé=("raised", "sum"), Projets=("id", "count")).reset_index().sort_values("Levé")
-        b.plotly_chart(plot_style(px.bar(r, x="Levé", y="region", orientation="h", title="Montant levé par territoire (€)", text="Projets"), 420), width="stretch")
+        b.plotly_chart(plot_style(px.bar(r, x="Levé", y="region", orientation="h", title="Montant levé par département (€)", text="Projets"), 420), width="stretch")
         sr = closed.groupby("sector").apply(lambda g: (g["status"] == "finance").mean() * 100, include_groups=False).reset_index(name="Taux de réussite %")
         if not sr.empty:
             st.plotly_chart(plot_style(px.bar(sr, x="sector", y="Taux de réussite %", title="Taux de réussite des collectes clôturées par secteur")), width="stretch")
@@ -688,7 +762,7 @@ def page_submit():
         description = st.text_area("Description détaillée (problème, solution, utilisation des fonds) *", height=170)
         c1, c2, c3 = st.columns(3)
         sector = c1.selectbox("Secteur *", list(db.SECTORS))
-        region = c2.selectbox("Territoire *", db.REGIONS)
+        region = c2.selectbox("Département *", db.REGIONS)
         team = c3.number_input("Taille de l'équipe", 1, 50, 1)
         image = st.file_uploader("Image de couverture (JPG/PNG, 16:9 conseillé)", type=["jpg", "jpeg", "png", "webp"])
 
@@ -841,7 +915,7 @@ def page_me():
             with st.form("prefs"):
                 st.caption("Ces préférences servent à classer les projets par adéquation dans « Explorer ».")
                 sectors = st.multiselect("Secteurs privilégiés", list(db.SECTORS), default=prefs.get("sectors", []))
-                regions = st.multiselect("Territoires privilégiés", db.REGIONS, default=prefs.get("regions", []))
+                regions = st.multiselect("Départements privilégiés", db.REGIONS, default=prefs.get("regions", []))
                 modes = st.multiselect("Modes de financement", list(db.MODES), format_func=db.MODES.get, default=prefs.get("modes", []))
                 odd = st.multiselect("ODD prioritaires", list(db.ODD), format_func=lambda k: f"ODD {k} · {db.ODD[k]}", default=prefs.get("odd", []))
                 max_ticket = st.number_input("Ticket maximum par projet (€)", 0, 1_000_000, int(prefs.get("max_ticket", 0) or 0), 50)
@@ -849,7 +923,7 @@ def page_me():
                 w = prefs.get("weights", {})
                 cs = st.columns(6)
                 weights = {k: cs[i].slider(lbl, 0, 50, int(w.get(k, d)), 5) for i, (k, lbl, d) in enumerate(
-                    [("sector", "Secteur", 25), ("region", "Territoire", 15), ("mode", "Mode", 15),
+                    [("sector", "Secteur", 25), ("region", "Département", 15), ("mode", "Mode", 15),
                      ("odd", "ODD", 15), ("ticket", "Ticket", 10), ("criteria", "Critères", 20)])}
                 if st.form_submit_button("Enregistrer mes préférences", type="primary"):
                     db.save_prefs(u["id"], {"sectors": sectors, "regions": regions, "modes": modes, "odd": odd,
@@ -954,8 +1028,9 @@ ROUTES.get(page, page_home)()
 
 st.markdown(
     "<div class='disclaimer'>ÉLAN — prototype de démonstration : les paiements sont simulés. Une mise en production "
-    "en France nécessite l'agrément de prestataire de services de financement participatif (PSFP, règlement UE 2020/1503) "
-    "délivré par l'AMF, un partenariat avec un établissement de paiement agréé et un dispositif LCB-FT complet. "
+    "exige les autorisations du pays d'exploitation (en Haïti, encadrement de la Banque de la République d'Haïti ; "
+    "pour collecter auprès d'investisseurs en France, agrément PSFP — règlement UE 2020/1503 — délivré par l'AMF), "
+    "un partenariat avec un établissement de paiement agréé et un dispositif LCB-FT complet. "
     "Investir dans de jeunes entreprises comporte un risque de perte totale ou partielle du capital.</div>",
     unsafe_allow_html=True,
 )

@@ -12,6 +12,8 @@ import os
 import random
 import secrets
 import sqlite3
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -34,12 +36,20 @@ SECTORS = {
     "Économie sociale & solidaire": "🤝",
 }
 
-REGIONS = [
-    "Île-de-France", "Auvergne-Rhône-Alpes", "Hauts-de-France", "Occitanie",
-    "Nouvelle-Aquitaine", "Provence-Alpes-Côte d'Azur", "Grand Est",
-    "Bretagne", "Pays de la Loire", "Guadeloupe", "Martinique", "Guyane",
-    "La Réunion", "Mayotte",
-]
+# Les 10 départements d'Haïti : chef-lieu et coordonnées (lat, lon) du chef-lieu
+DEPARTMENTS = {
+    "Ouest": ("Port-au-Prince", 18.5944, -72.3074),
+    "Artibonite": ("Gonaïves", 19.4475, -72.6892),
+    "Centre": ("Hinche", 19.1450, -72.0050),
+    "Nord": ("Cap-Haïtien", 19.7578, -72.2042),
+    "Nord-Est": ("Fort-Liberté", 19.6656, -71.8386),
+    "Nord-Ouest": ("Port-de-Paix", 19.9397, -72.8303),
+    "Grand'Anse": ("Jérémie", 18.6500, -74.1167),
+    "Nippes": ("Miragoâne", 18.4460, -73.0890),
+    "Sud": ("Les Cayes", 18.1933, -73.7461),
+    "Sud-Est": ("Jacmel", 18.2342, -72.5347),
+}
+REGIONS = list(DEPARTMENTS)
 
 MODES = {
     "don": "Don / récompense (crowdfunding)",
@@ -94,7 +104,7 @@ PALETTES = [
 # --------------------------------------------------------------------------
 def connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
     return con
@@ -185,6 +195,10 @@ CREATE TABLE IF NOT EXISTS preferences (
     user_id INTEGER PRIMARY KEY REFERENCES users(id),
     data TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
 CREATE TABLE IF NOT EXISTS favorites (
     user_id INTEGER NOT NULL REFERENCES users(id),
     project_id INTEGER NOT NULL REFERENCES projects(id),
@@ -197,15 +211,82 @@ def now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+SEED_VERSION = "haiti-1"
+_INIT_LOCK = threading.Lock()
+DATA_TABLES = ["favorites", "preferences", "comments", "messages", "updates", "contributions", "projects", "users"]
+
+
+@contextmanager
+def _file_lock():
+    """Verrou inter-processus : une seule initialisation à la fois (Streamlit Cloud lance
+    plusieurs sessions en parallèle, ce qui provoquait l'IntegrityError sur admin@elan.fr)."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(DB_PATH.with_suffix(".lock"), "w")
+    try:
+        try:
+            import fcntl
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        except ImportError:  # Windows : le verrou de thread suffit en local
+            pass
+        yield
+    finally:
+        fh.close()
+
+
 def init_db(seed: bool = True) -> None:
-    con = connect()
-    con.executescript(SCHEMA)
-    con.commit()
-    empty = con.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
-    con.close()
-    if seed and empty:
-        seed_demo()
+    """Crée le schéma et, si besoin, le jeu de démonstration — de façon idempotente.
+
+    - Verrou (thread + fichier) : deux sessions ne peuvent plus amorcer la base en même temps.
+    - Drapeau `meta.seeded` posé seulement quand l'amorçage est complet.
+    - Base à moitié amorcée (plantage précédent) ou démo d'une ancienne version : purgée et
+      ré-amorcée, uniquement si elle ne contient que des comptes de démonstration (@elan.fr).
+    """
+    with _INIT_LOCK, _file_lock():
+        con = connect()
+        con.executescript(SCHEMA)
+        con.commit()
+        row = con.execute("SELECT value FROM meta WHERE key='seeded'").fetchone()
+        seeded = row["value"] if row else None
+        n_users = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        n_real = con.execute("SELECT COUNT(*) FROM users WHERE email NOT LIKE '%@elan.fr'").fetchone()[0]
+        if seed and seeded != SEED_VERSION:
+            if n_users and n_real == 0:
+                for t in DATA_TABLES:
+                    con.execute(f"DELETE FROM {t}")
+                con.execute("DELETE FROM sqlite_sequence")
+                con.commit()
+                n_users = 0
+            if n_users == 0:
+                con.close()
+                seed_demo()
+                con = connect()
+            con.execute("INSERT INTO meta(key,value) VALUES ('seeded',?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (SEED_VERSION,))
+            con.commit()
+        con.close()
     refresh_statuses()
+
+
+def department_stats():
+    """Agrégats par département d'Haïti (tous départements, même sans projet)."""
+    import pandas as pd
+
+    df = projects_df()
+    rows = []
+    for dep, (city, lat, lon) in DEPARTMENTS.items():
+        d = df[df["region"] == dep] if not df.empty else df
+        rows.append({
+            "Département": dep, "Chef-lieu": city, "lat": lat, "lon": lon,
+            "Projets publiés": int(len(d)),
+            "Projets soutenus": int((d["raised"] > 0).sum()) if len(d) else 0,
+            "Projets financés": int((d["status"] == "finance").sum()) if len(d) else 0,
+            "En collecte": int((d["status"] == "en_cours").sum()) if len(d) else 0,
+            "Montant levé (€)": float(d["raised"].sum()) if len(d) else 0.0,
+            "Contributeurs": int(d["backers"].sum()) if len(d) else 0,
+            "Emplois créés": int(d["jobs_done"].sum()) if len(d) else 0,
+            "Bénéficiaires": int(d["benef_done"].sum()) if len(d) else 0,
+        })
+    return pd.DataFrame(rows)
 
 
 # --------------------------------------------------------------------------
@@ -640,28 +721,29 @@ DEMO_PASSWORD = "demo1234"
 
 DEMO_PROJECTS = [
     # titre, accroche, secteur, région, mode, objectif, âge, avancement(0-1.3), statut, jobs, bénéf, co2, odd
-    ("Kalbas Kréyòl", "Une conserverie artisanale de fruits locaux anti-gaspillage", "AgriTech & Alimentation", "Guadeloupe", "mixte", 45000, 26, 1.12, "finance", 6, 1200, 35, "2,8,12"),
-    ("SolarKids", "Kits solaires pédagogiques pour les écoles rurales", "Énergie & Climat", "Guyane", "don", 18000, 24, 1.31, "finance", 3, 2400, 60, "4,7,13"),
-    ("ReFab Lab", "Atelier de reconditionnement d'électroménager en insertion", "Économie circulaire", "Hauts-de-France", "pret", 60000, 29, 1.05, "finance", 9, 800, 140, "8,12,13"),
-    ("Mentor'Up", "Plateforme de mentorat pour lycéens des quartiers prioritaires", "Éducation", "Île-de-France", "equity", 120000, 27, 1.0, "finance", 7, 3500, 0, "4,10"),
-    ("Pédal'Eau", "Livraison du dernier kilomètre en vélo-cargo électrique", "Mobilité", "Auvergne-Rhône-Alpes", "equity", 90000, 28, 1.08, "finance", 12, 0, 210, "11,13"),
-    ("Fil Vert", "Mode upcyclée à partir de textiles de seconde main", "Mode durable", "Occitanie", "don", 15000, 22, 1.18, "finance", 2, 600, 18, "5,12"),
-    ("TéléSoins Péyi", "Téléconsultation et suivi des patients isolés", "Santé & Bien-être", "Martinique", "equity", 150000, 30, 0.62, "en_cours", 10, 5000, 0, "3,10"),
-    ("Ruche Urbaine", "Ruchers en toiture et ateliers de sensibilisation", "AgriTech & Alimentation", "Nouvelle-Aquitaine", "don", 12000, 23, 0.74, "en_cours", 2, 900, 4, "15,11"),
-    ("CodeLakou", "École de code gratuite pour les 16-25 ans", "Numérique & Tech", "La Réunion", "mixte", 70000, 25, 0.48, "en_cours", 5, 400, 0, "4,8,10"),
-    ("Studio Marronnage", "Studio de création musicale et transmission culturelle", "Culture & Création", "Guadeloupe", "don", 25000, 21, 0.35, "en_cours", 3, 1500, 0, "4,11"),
-    ("Aqua Mayotte", "Filtres à eau low-tech fabriqués localement", "Économie sociale & solidaire", "Mayotte", "pret", 40000, 27, 0.83, "en_cours", 6, 7000, 12, "6,3,1"),
-    ("Hélios Coop", "Coopérative citoyenne de panneaux solaires sur toits publics", "Énergie & Climat", "Bretagne", "pret", 80000, 29, 0.56, "en_cours", 4, 0, 320, "7,13,17"),
-    ("Sentiers Vivants", "Écotourisme encadré par de jeunes guides locaux", "Tourisme responsable", "Guyane", "mixte", 35000, 24, 0.22, "en_cours", 8, 2000, 10, "8,15"),
-    ("Cantine Solidaire 13", "Traiteur d'insertion zéro déchet", "Économie sociale & solidaire", "Provence-Alpes-Côte d'Azur", "don", 20000, 26, 0.91, "en_cours", 5, 3000, 8, "2,8,12"),
-    ("Grain de Sel", "Épicerie vrac itinérante en zone rurale", "Économie circulaire", "Grand Est", "don", 14000, 22, 0.41, "echoue", 2, 700, 6, "12"),
-    ("NeuroPlay", "Jeux sérieux pour la rééducation des enfants", "Santé & Bien-être", "Pays de la Loire", "equity", 200000, 31, 0.0, "en_revue", 6, 1000, 0, "3,4"),
+    ("Kalbas Kréyòl", "Conserverie artisanale de mangues et fruits locaux anti-gaspillage", "AgriTech & Alimentation", "Sud", "mixte", 45000, 26, 1.12, "finance", 6, 1200, 35, "2,8,12"),
+    ("SolarKids", "Kits solaires pédagogiques pour les écoles rurales", "Énergie & Climat", "Centre", "don", 18000, 24, 1.31, "finance", 3, 2400, 60, "4,7,13"),
+    ("ReFab Lab", "Atelier de réparation d'électroménager et d'insertion des jeunes", "Économie circulaire", "Ouest", "pret", 60000, 29, 1.05, "finance", 9, 800, 140, "8,12,13"),
+    ("Mentor'Up", "Mentorat et orientation pour les lycéens du Nord", "Éducation", "Nord", "equity", 120000, 27, 1.0, "finance", 7, 3500, 0, "4,10"),
+    ("Moto Vèt", "Taxis-motos électriques rechargés à l'énergie solaire", "Mobilité", "Ouest", "equity", 90000, 28, 1.08, "finance", 12, 0, 210, "11,13"),
+    ("Fil Vert Jakmèl", "Mode upcyclée et artisanat en papier mâché", "Mode durable", "Sud-Est", "don", 15000, 22, 1.18, "finance", 2, 600, 18, "5,12"),
+    ("TéléSoins Péyi", "Téléconsultation et suivi des patients isolés", "Santé & Bien-être", "Grand'Anse", "equity", 150000, 30, 0.62, "en_cours", 10, 5000, 0, "3,10"),
+    ("Myèl Lakay", "Apiculture et transformation du miel en coopérative", "AgriTech & Alimentation", "Nippes", "don", 12000, 23, 0.74, "en_cours", 2, 900, 4, "15,1"),
+    ("CodeLakou", "École de code gratuite pour les 16-25 ans", "Numérique & Tech", "Nord", "mixte", 70000, 25, 0.48, "en_cours", 5, 400, 0, "4,8,10"),
+    ("Studio Rasin", "Studio de création musicale et transmission culturelle", "Culture & Création", "Ouest", "don", 25000, 21, 0.35, "en_cours", 3, 1500, 0, "4,11"),
+    ("Dlo Pwòp", "Filtres à eau low-tech fabriqués localement", "Économie sociale & solidaire", "Artibonite", "pret", 40000, 27, 0.83, "en_cours", 6, 7000, 12, "6,3,1"),
+    ("Limyè Coop", "Coopérative de mini-réseaux solaires pour les marchés", "Énergie & Climat", "Nord-Est", "pret", 80000, 29, 0.56, "en_cours", 4, 0, 320, "7,13,17"),
+    ("Sentiers du Môle", "Écotourisme encadré par de jeunes guides locaux", "Tourisme responsable", "Nord-Ouest", "mixte", 35000, 24, 0.22, "en_cours", 8, 2000, 10, "8,15"),
+    ("Cantine Solidaire Gonayiv", "Traiteur d'insertion zéro déchet", "Économie sociale & solidaire", "Artibonite", "don", 20000, 26, 0.91, "en_cours", 5, 3000, 8, "2,8,12"),
+    ("Kafe Lakay", "Torréfaction de café des mornes en circuit court", "AgriTech & Alimentation", "Sud-Est", "mixte", 30000, 25, 1.06, "finance", 5, 1500, 20, "2,8,15"),
+    ("Grain de Sel", "Épicerie vrac itinérante en zone rurale", "Économie circulaire", "Centre", "don", 14000, 22, 0.41, "echoue", 2, 700, 6, "12"),
+    ("NeuroPlay", "Jeux sérieux pour la rééducation des enfants", "Santé & Bien-être", "Ouest", "equity", 200000, 31, 0.0, "en_revue", 6, 1000, 0, "3,4"),
 ]
 
 DEMO_PORTEURS = [
-    ("Maëlys Désir", "Pointe-à-Pitre"), ("Kévin Ho-A-Sim", "Cayenne"), ("Inès Belkacem", "Roubaix"),
-    ("Moussa Diarra", "Saint-Denis"), ("Léa Martin", "Lyon"), ("Chloé Fabre", "Toulouse"),
-    ("Jordan Lise", "Fort-de-France"), ("Anaïs Dubreuil", "Bordeaux"),
+    ("Mirlande Jean-Baptiste", "Les Cayes"), ("Kervens Pierre", "Hinche"), ("Nadège Louis", "Port-au-Prince"),
+    ("Wilson Joseph", "Cap-Haïtien"), ("Stéphanie Étienne", "Jacmel"), ("Jean-Rony Désir", "Jérémie"),
+    ("Fabiola Charles", "Gonaïves"), ("Daniel Augustin", "Fort-Liberté"),
 ]
 DEMO_INVESTORS = [
     ("Paul Lemoine", "Business angel — impact & édutech", "verifie"),
@@ -669,7 +751,7 @@ DEMO_INVESTORS = [
     ("Sarah Benali", "Particulière engagée, dons réguliers", "verifie"),
     ("Thomas Girard", "Investisseur particulier, climat", "en_cours"),
     ("Amandine Roux", "Contributrice crowdfunding", "non_verifie"),
-    ("Diaspora Invest", "Club d'investisseurs de la diaspora caribéenne", "verifie"),
+    ("Diaspora Invest", "Club d'investisseurs de la diaspora haïtienne", "verifie"),
 ]
 
 
@@ -688,7 +770,7 @@ def seed_demo() -> None:
     investors = []
     for i, (name, bio, kyc) in enumerate(DEMO_INVESTORS):
         investors.append(create_user(f"investisseur{i + 1}@elan.fr", name, DEMO_PASSWORD, "investisseur", bio=bio,
-                                     kyc_status=kyc, city=rnd.choice(["Paris", "Lyon", "Pointe-à-Pitre", "Nantes"]),
+                                     kyc_status=kyc, city=rnd.choice(["Paris", "Montréal", "Miami", "Pétion-Ville", "Port-au-Prince"]),
                                      created_at=(base - timedelta(days=360 - i * 7)).isoformat(timespec="seconds")))
 
     descriptions = (
@@ -771,5 +853,5 @@ def seed_demo() -> None:
     save_prefs(investors[0], {"sectors": ["Éducation", "Santé & Bien-être", "Numérique & Tech"], "regions": [],
                               "modes": ["equity"], "odd": [4, 3, 10], "max_ticket": 5000})
     save_prefs(investors[2], {"sectors": ["AgriTech & Alimentation", "Économie sociale & solidaire"],
-                              "regions": ["Guadeloupe", "Martinique", "Guyane", "La Réunion", "Mayotte"],
+                              "regions": ["Sud", "Grand'Anse", "Nippes", "Artibonite"],
                               "modes": ["don"], "odd": [2, 6, 12], "max_ticket": 300})

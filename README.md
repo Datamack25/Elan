@@ -7,10 +7,11 @@ Plateforme Streamlit qui met en relation de **jeunes porteurs de projet (≤ 30 
 | Module | Contenu |
 |---|---|
 | 🏠 Accueil | Chiffres clés, vitrine des projets financés, projets proches de l'objectif |
-| 🔎 Explorer | Filtres (secteur, territoire, mode, ODD, statut, ticket max), **critères obligatoires**, score de critères minimum, **classement** par adéquation aux préférences, critères, impact, avancement, date limite… Vue cartes ou tableau |
+| 🔎 Explorer | Filtres (secteur, département, mode, ODD, statut, ticket max), **critères obligatoires**, score de critères minimum, **classement** par adéquation aux préférences, critères, impact, avancement, date limite… Vue cartes ou tableau |
 | 📄 Fiche projet | Image, description, contreparties, financement (don / prêt / capital avec simulation de part ou de remboursement), impact visé vs constaté, checklist des critères, actualités, **questions publiques**, **message privé au porteur**, contributeurs |
 | 🏆 Projets financés | Galerie avec image, montant levé, emplois créés, bénéficiaires, CO₂ évité |
-| 📊 Statistiques | Collecte mensuelle et cumulée, modes de financement, secteurs, territoires, taux de réussite, impact, ODD, qualité vs impact, classements, export CSV |
+| 🇭🇹 Carte d'Haïti | Sur l'accueil et en tête du tableau de bord : une bulle par département (10), taille et couleur selon l'indicateur choisi — projets soutenus, montant levé, projets financés, emplois créés, contributeurs. Tableau par département exportable |
+| 📊 Statistiques | Collecte mensuelle et cumulée, modes de financement, secteurs, départements, taux de réussite, impact, ODD, qualité vs impact, classements, export CSV |
 | 💬 Messagerie | Conversations privées investisseurs ↔ porteurs, par projet, avec non-lus |
 | 🚀 Soumettre | Formulaire complet (image, financement, impact, ODD, justificatifs, engagements) → validation par l'équipe |
 | 👤 Mon espace | Porteur : suivi de collecte, publication d'actualités et de résultats d'impact. Investisseur : portefeuille, **préférences et pondérations du classement**, favoris, recommandations. KYC pour tous |
@@ -48,6 +49,10 @@ data/                base SQLite (ignorée par git)
 ```
 
 ## Déploiement Streamlit Cloud
+L'initialisation de la base est protégée contre les démarrages simultanés (verrou + `st.cache_resource`) : l'erreur `sqlite3.IntegrityError` sur `admin@elan.fr` ne peut plus se produire. Une base restée à moitié amorcée après un plantage est purgée et ré-amorcée automatiquement, à condition qu'elle ne contienne que des comptes de démonstration (`@elan.fr`).
+
+La carte utilise le fond de carte gratuit Carto (aucune clé API).
+
 Sur Streamlit Community Cloud, le disque n'est pas persistant : la base est recréée à chaque redémarrage. Pour une utilisation réelle, remplacez SQLite par une base hébergée (PostgreSQL / Supabase) et stockez les images dans un stockage objet.
 
 ## Avant une mise en production réelle
